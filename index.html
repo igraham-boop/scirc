@@ -1,0 +1,1235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Short Circuit Showdown</title>
+  <style>
+    html,body{margin:0;height:100%;background:#080a0c;color:#e9eef2;font-family:system-ui,Segoe UI,Arial}
+    .wrap{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:12px}
+    canvas{background:#0b0f14;border:2px solid #36ff36;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.45)}
+    .hud{max-width:980px;opacity:.95;font-size:14px;line-height:1.35;text-align:center}
+    .hud b{color:#36ff36}
+    .hud .k{display:inline-block;padding:2px 7px;border:1px solid rgba(255,255,255,.25);border-radius:8px;margin:0 2px;background:rgba(0,0,0,.25)}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="c" width="960" height="540"></canvas>
+  <div class="hud">
+    <b>ENTER</b> Start · <b>I</b> Instructions ·
+    <span class="k">←</span><span class="k">→</span> Move · <span class="k">SPACE</span> Jump ·
+    <span class="k">A</span> Chop · <span class="k">S</span> Knee · <span class="k">D</span> Kick ·
+    <span class="k">SHIFT</span> Block · <span class="k">SHIFT</span>+<span class="k">↓</span> Focus (regen) ·
+    <b>Combos:</b> chain A/S/D quickly for a finisher
+  </div>
+</div>
+
+<script>
+(() => {
+  // ---------------- Canvas ----------------
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+
+  const W = canvas.width, H = canvas.height;
+  const GROUND = 445;
+  const GRAV = 0.85;
+
+  // ---------------- Input ----------------
+  const keys = new Set();
+  const pressed = new Set(); // edge-triggered
+  addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (!keys.has(k)) pressed.add(k);
+    keys.add(k);
+    if (["arrowleft","arrowright","arrowup","arrowdown"," "].includes(k) || e.key===" ") e.preventDefault();
+  }, {passive:false});
+  addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+
+  const isDown = (k)=> keys.has(k);
+  const wasPressed = (k)=> pressed.has(k);
+
+  // ---------------- Helpers ----------------
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp = (a,b,t)=>a+(b-a)*t;
+  const rand = (a,b)=>a+Math.random()*(b-a);
+  const sign = (x)=> x<0?-1:x>0?1:0;
+
+  function rectOverlap(a,b){
+    return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+  }
+
+  // ---------------- Game States ----------------
+  const STATE = { TITLE:0, INSTR:1, ROUND:2, PLAY:3, WIN:4, LOSE:5 };
+  let state = STATE.TITLE;
+
+  const LEVELS = [
+    { name:"Hallway Hijinks", scene:"hallway", enemyType:"robot", enemyHP:100, enemySpeed:2.4, dmg:10 },
+    { name:"Cafeteria Circuit", scene:"cafeteria", enemyType:"robot", enemyHP:120, enemySpeed:2.7, dmg:11 },
+    { name:"Gym Gauntlet", scene:"gym", enemyType:"robot", enemyHP:140, enemySpeed:3.0, dmg:12 },
+    { name:"Final: Classroom Override", scene:"classroom", enemyType:"boss", enemyHP:190, enemySpeed:2.3, dmg:14 },
+  ];
+  let level = 0;
+
+  // ---------------- Juice (feel) ----------------
+  let shake = 0;
+  let hitstop = 0; // frames
+  function addShake(n){ shake = Math.max(shake, n); }
+  function doHitstop(fr){ hitstop = Math.max(hitstop, fr); }
+
+  // Particles
+  const fx = [];
+  function spark(x,y,dir){
+    for(let i=0;i<10;i++){
+      fx.push({x,y,vx:(dir*rand(2,6))+rand(-1,1), vy:rand(-4,2), life:rand(12,22), t:"spark"});
+    }
+  }
+  function dust(x,y){
+    for(let i=0;i<7;i++){
+      fx.push({x,y,vx:rand(-2.2,2.2), vy:rand(-2.5,-0.4), life:rand(16,26), t:"dust"});
+    }
+  }
+
+  // ---------------- Combat timing ----------------
+  // Fighting game-ish: startup/active/recovery in FRAMES
+  const MOVES = {
+    a: { name:"Chop",  startup:6,  active:4,  rec:10, range:78,  y:285, h:44, dmg:14, push:18 },
+    s: { name:"Knee",  startup:7,  active:5,  rec:12, range:70,  y:300, h:54, dmg:16, push:20 },
+    d: { name:"Kick",  startup:9,  active:5,  rec:14, range:96,  y:310, h:46, dmg:18, push:24 },
+    f: { name:"Finisher", startup:10, active:6, rec:18, range:118, y:295, h:54, dmg:26, push:34 },
+  };
+
+  const INPUT_BUFFER = 10;      // frames buffered
+  const COMBO_WINDOW = 18;      // frames to chain
+  const MAX_CHAIN = 3;
+
+  // ---------------- Entities ----------------
+  const deuce = {
+    x: 170, y: GROUND, vx:0, vy:0, face: 1,
+    hp: 120, maxHp:120,
+    onGround:true,
+
+    // state machine
+    st: "idle",      // idle, walk, jump, block, attack, hit, KO
+    stF: 0,          // frames in current state
+    stun: 0,         // hitstun frames
+    blockstun: 0,
+    buffer: [],      // [{k, ttl}]
+    chain: "",       // "as", "asd"
+    chainT: 0,       // combo window timer
+    move: null,      // {id, phase:'startup'|'active'|'rec', t, didHit}
+    focusT: 0,       // frames holding focus
+  };
+
+  const foe = {
+    x: 760, y: GROUND, vx:0, vy:0, face:-1,
+    hp: 100, maxHp:100,
+    type:"robot",
+    st:"idle",
+    stF:0,
+    stun:0,
+    blockstun:0,
+    move:null,
+    aiT:0,
+    telegraph:0, // frames glowing before attack
+  };
+
+  const pickups = []; // small battery heals
+  function spawnBattery(x,y){
+    pickups.push({x,y,vx:rand(-1.3,1.3), vy:-6.5, life:900});
+  }
+
+  // ---------------- State helpers ----------------
+  function setState(ent, s){
+    if (ent.st !== s){ ent.st = s; ent.stF = 0; }
+  }
+
+  function resetRound(){
+    const L = LEVELS[level];
+    deuce.x=170; deuce.y=GROUND; deuce.vx=0; deuce.vy=0; deuce.face=1;
+    deuce.onGround=true; deuce.stun=0; deuce.blockstun=0; deuce.move=null;
+    deuce.chain=""; deuce.chainT=0; deuce.buffer=[]; deuce.focusT=0;
+    setState(deuce,"idle");
+
+    foe.type=L.enemyType;
+    foe.maxHp=L.enemyHP; foe.hp=L.enemyHP;
+    foe.x=760; foe.y=GROUND; foe.vx=0; foe.vy=0; foe.face=-1;
+    foe.stun=0; foe.blockstun=0; foe.move=null; foe.aiT=0; foe.telegraph=0;
+    setState(foe,"idle");
+
+    pickups.length=0;
+    state = STATE.ROUND;
+  }
+
+  // ---------------- Buffer / Combo ----------------
+  function bufferInput(k){
+    deuce.buffer.push({k, ttl: INPUT_BUFFER});
+  }
+
+  function consumeBuffered(){
+    // find first available and try to start move
+    for(let i=0;i<deuce.buffer.length;i++){
+      const k = deuce.buffer[i].k;
+      if (tryStartMove(k)){
+        deuce.buffer.splice(i,1);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function tryStartMove(k){
+    if (!(k in MOVES)) return false;
+    if (deuce.stun>0 || deuce.blockstun>0) return false;
+    if (deuce.move) return false; // no cancels for now (keeps it readable)
+
+    // combo chain tracking
+    if (deuce.chainT > 0 && deuce.chain.length < MAX_CHAIN) deuce.chain += k;
+    else deuce.chain = k;
+
+    deuce.chainT = COMBO_WINDOW;
+
+    const isFinisher = (deuce.chain.length >= 3);
+    const id = isFinisher ? "f" : k;
+
+    deuce.move = { id, phase:"startup", t: MOVES[id].startup, didHit:false };
+    setState(deuce, "attack");
+    dust(deuce.x + deuce.face*18, GROUND-6);
+    return true;
+  }
+
+  // ---------------- Hitboxes ----------------
+  function hurtbox(ent){
+    // slightly slimmer than visuals for fairness
+    const w = (ent === foe && foe.type==="boss") ? 90 : 72;
+    const h = (ent === foe && foe.type==="boss") ? 150 : 132;
+    return { x: ent.x - w/2, y: ent.y - h, w, h };
+  }
+
+  function attackBox(attacker){
+    const ent = attacker;
+    const m = ent.move ? MOVES[ent.move.id] : null;
+    if (!m) return null;
+    if (ent.move.phase !== "active") return null;
+
+    const hb = hurtbox(ent);
+    const x = ent.x + ent.face*(hb.w/2 + 10);
+    const y = m.y; // absolute-ish baseline tuned for readability
+    // Convert y baseline to world:
+    const top = ent.y - (ent === foe && foe.type==="boss" ? 160 : 140);
+    return {
+      x: (ent.face===1 ? x : x - m.range),
+      y: top + (m.y - 260),
+      w: m.range,
+      h: m.h
+    };
+  }
+
+  // ---------------- Damage resolve ----------------
+  function applyHit(attacker, defender, dmgBase, push){
+    const isBlocking = (defender === deuce)
+      ? (isDown("shift") && defender.st !== "jump")
+      : (defender.st === "block");
+
+    if (isBlocking){
+      // full block (no chip), but blockstun + small pushback
+      defender.blockstun = 10;
+      setState(defender, "block");
+      defender.x += attacker.face * (push*0.45);
+      spark(defender.x, defender.y-90, attacker.face);
+      doHitstop(4);
+      addShake(3);
+      return;
+    }
+
+    defender.hp -= dmgBase;
+    defender.stun = 14;
+    setState(defender, "hit");
+    defender.x += attacker.face * push;
+    spark(defender.x, defender.y-90, attacker.face);
+    doHitstop(6);
+    addShake(6);
+  }
+
+  // ---------------- Enemy AI (readable + fair) ----------------
+  function foeWantsBlock(){
+    // blocks occasionally if player is attacking and close
+    if (!deuce.move) return false;
+    const dist = Math.abs(deuce.x - foe.x);
+    return dist < 170 && Math.random() < 0.35;
+  }
+
+  function foeTryAttack(){
+    if (foe.stun>0 || foe.blockstun>0) return;
+    if (foe.move) return;
+    if (foe.telegraph>0) return;
+
+    const dist = Math.abs(deuce.x - foe.x);
+    // choose a move based on distance
+    let pickMove = "a";
+    if (dist > 160) pickMove = "d";
+    else if (dist > 120) pickMove = "s";
+    else pickMove = Math.random()<0.55 ? "a":"s";
+
+    // Telegraph before committing (makes it dodgeable)
+    foe.telegraph = (foe.type==="boss") ? 16 : 14;
+    foe._queued = pickMove;
+    setState(foe, "attack"); // pre-pose
+  }
+
+  function foeCommitQueued(){
+    const id = foe._queued || "a";
+    // boss sometimes uses finisher-ish bigger move
+    const realId = (foe.type==="boss" && Math.random()<0.35) ? "d" : id;
+
+    // mirror player move timings but slightly slower
+    foe.move = { id: realId, phase:"startup", t: MOVES[realId].startup+2, didHit:false };
+    foe._queued = null;
+  }
+
+  // ---------------- Rendering (better looking, non-boxy) ----------------
+  function drawBg(scene, t){
+    // stylized “semi-real” school environments with parallax + lighting
+    const time = t/1000;
+
+    // base
+    ctx.fillStyle = "#070a0e";
+    ctx.fillRect(0,0,W,H);
+
+    // vignette
+    const g = ctx.createRadialGradient(W/2,H/2,120, W/2,H/2,520);
+    g.addColorStop(0,"rgba(0,0,0,0)");
+    g.addColorStop(1,"rgba(0,0,0,0.55)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    // lights
+    function ceilingLights(){
+      for(let i=0;i<8;i++){
+        const x = 90 + i*110 + Math.sin(time*0.7+i)*4;
+        ctx.fillStyle = "rgba(255,255,255,0.06)";
+        ctx.fillRect(x, 38, 80, 14);
+        ctx.fillStyle = "rgba(120,255,140,0.05)";
+        ctx.fillRect(x+10, 52, 60, 3);
+      }
+    }
+
+    // floor
+    ctx.fillStyle = "rgba(255,255,255,0.02)";
+    ctx.fillRect(0, GROUND+10, W, H-(GROUND+10));
+
+    // scene details
+    if (scene==="hallway"){
+      // wall gradient
+      const w = ctx.createLinearGradient(0,0,0,H);
+      w.addColorStop(0,"#0d141c");
+      w.addColorStop(1,"#070a0e");
+      ctx.fillStyle = w;
+      ctx.fillRect(0,0,W,H);
+
+      // lockers parallax
+      const px = Math.sin(time*0.45)*6;
+      ctx.fillStyle = "rgba(20,34,44,0.9)";
+      for(let i=0;i<10;i++){
+        const x = 40 + i*92 + px;
+        ctx.fillRect(x, 120, 70, 230);
+        ctx.fillStyle = "rgba(255,255,255,0.05)";
+        ctx.fillRect(x+8, 140, 54, 2);
+        ctx.fillRect(x+8, 170, 54, 2);
+        ctx.fillRect(x+8, 200, 54, 2);
+        ctx.fillRect(x+8, 230, 54, 2);
+        ctx.fillStyle = "rgba(0,0,0,0.25)";
+        ctx.fillRect(x+58, 150, 6, 40);
+        ctx.fillStyle = "rgba(20,34,44,0.9)";
+      }
+      // exit sign
+      ctx.fillStyle="#2fff2f";
+      ctx.fillRect(450, 92, 60, 18);
+      ctx.fillStyle="#042009";
+      ctx.font="12px Arial";
+      ctx.fillText("EXIT", 469, 105);
+
+      ceilingLights();
+    }
+
+    if (scene==="cafeteria"){
+      const w = ctx.createLinearGradient(0,0,0,H);
+      w.addColorStop(0,"#0d1318");
+      w.addColorStop(1,"#070a0e");
+      ctx.fillStyle = w; ctx.fillRect(0,0,W,H);
+
+      // serving line
+      ctx.fillStyle="rgba(0,0,0,0.35)";
+      ctx.fillRect(0, 140, W, 90);
+      ctx.fillStyle="rgba(255,255,255,0.06)";
+      ctx.fillRect(0, 140, W, 6);
+
+      // menu board
+      ctx.fillStyle="rgba(10,14,18,0.9)";
+      ctx.fillRect(650, 40, 270, 90);
+      ctx.fillStyle="rgba(54,255,54,0.12)";
+      ctx.fillRect(660, 50, 250, 18);
+      ctx.fillStyle="#e9eef2";
+      ctx.font="14px Arial";
+      ctx.fillText("TODAY'S MENU:", 665, 64);
+      ctx.font="12px Arial";
+      ctx.fillText("• Pizza (100% non-sentient)", 665, 86);
+      ctx.fillText("• Mystery juice (ask later)", 665, 104);
+
+      // tables
+      const px = Math.sin(time*0.5)*7;
+      for(let i=0;i<4;i++){
+        const x = 110 + i*190 + px;
+        const y = 318 + (i%2)*18;
+        ctx.fillStyle="rgba(18,26,34,0.95)";
+        ctx.fillRect(x,y,150,18);
+        ctx.fillStyle="rgba(8,10,12,0.45)";
+        ctx.fillRect(x-12,y+18,174,10);
+      }
+
+      ceilingLights();
+    }
+
+    if (scene==="gym"){
+      const w = ctx.createLinearGradient(0,0,0,H);
+      w.addColorStop(0,"#0b1117");
+      w.addColorStop(1,"#070a0e");
+      ctx.fillStyle = w; ctx.fillRect(0,0,W,H);
+
+      // court
+      ctx.fillStyle="rgba(160,110,60,0.14)";
+      ctx.fillRect(0, GROUND-110, W, 150);
+      ctx.strokeStyle="rgba(255,255,255,0.08)";
+      ctx.lineWidth=2;
+      ctx.strokeRect(280, GROUND-85, 400, 120);
+      ctx.beginPath(); ctx.arc(W/2, GROUND-25, 58, 0, Math.PI*2); ctx.stroke();
+
+      // bleachers
+      ctx.fillStyle="rgba(18,24,32,0.85)";
+      for(let i=0;i<7;i++){
+        ctx.fillRect(45, 150+i*24, 280, 18);
+      }
+
+      ceilingLights();
+    }
+
+    if (scene==="classroom"){
+      const w = ctx.createLinearGradient(0,0,0,H);
+      w.addColorStop(0,"#0d141c");
+      w.addColorStop(1,"#070a0e");
+      ctx.fillStyle = w; ctx.fillRect(0,0,W,H);
+
+      // whiteboard
+      ctx.fillStyle="rgba(255,255,255,0.08)";
+      ctx.fillRect(70, 70, 540, 120);
+      ctx.fillStyle="rgba(255,255,255,0.85)";
+      ctx.fillRect(84, 84, 512, 92);
+      ctx.fillStyle="#111";
+      ctx.font="18px Arial";
+      ctx.fillText("POP QUIZ:", 110, 120);
+      ctx.font="14px Arial";
+      ctx.fillText("1) Identify robot student.", 110, 148);
+      ctx.fillText("2) Ask it politely to power down.", 110, 168);
+
+      // desks
+      ctx.fillStyle="rgba(18,26,34,0.9)";
+      for(let r=0;r<2;r++){
+        for(let i=0;i<4;i++){
+          const x = 130 + i*180 + Math.sin(time*0.35)*6;
+          const y = 330 + r*80;
+          ctx.fillRect(x, y, 130, 16);
+          ctx.fillStyle="rgba(0,0,0,0.35)";
+          ctx.fillRect(x-10, y+16, 150, 10);
+          ctx.fillStyle="rgba(18,26,34,0.9)";
+        }
+      }
+
+      ceilingLights();
+    }
+
+    // ground line
+    ctx.fillStyle="rgba(0,0,0,0.55)";
+    ctx.fillRect(0, GROUND+12, W, 80);
+
+    // film grain (subtle)
+    ctx.fillStyle="rgba(255,255,255,0.03)";
+    for(let i=0;i<110;i++){
+      ctx.fillRect((Math.random()*W)|0, (Math.random()*H)|0, 1, 1);
+    }
+  }
+
+  function thickLine(x1,y1,x2,y2,w, col, outlineCol="rgba(0,0,0,0.75)"){
+    ctx.lineCap="round";
+    ctx.strokeStyle=outlineCol;
+    ctx.lineWidth=w+3;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    ctx.strokeStyle=col;
+    ctx.lineWidth=w;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  }
+
+  function drawDeuce(t){
+    // articulated, readable silhouette with shading + hoodie text
+    const hb = hurtbox(deuce);
+    const x = deuce.x, y = deuce.y;
+    const face = deuce.face;
+
+    const walk = (deuce.st==="walk") ? Math.sin(t*10) : 0;
+    const bob = (deuce.st==="idle") ? Math.sin(t*3)*1.2 : Math.abs(walk)*1.6;
+    const jumpLift = (deuce.st==="jump") ? -6 : 0;
+    const baseY = y - 126 + bob + jumpLift;
+
+    // pose driver
+    const atkId = deuce.move ? deuce.move.id : null;
+    const atkPhase = deuce.move ? deuce.move.phase : null;
+    const atkProg = deuce.move ? 1 - (deuce.move.t / (MOVES[atkId].startup + MOVES[atkId].active + MOVES[atkId].rec)) : 0;
+
+    // joints
+    const head = {x:x, y:baseY+18};
+    const neck = {x:x, y:baseY+38};
+    const chest= {x:x, y:baseY+62};
+    const hip  = {x:x, y:baseY+92};
+
+    // shoulders
+    let shL = {x:x-18, y:baseY+55};
+    let shR = {x:x+18, y:baseY+55};
+
+    // default hands
+    let handL = {x:x-26 - walk*6, y:baseY+86 + walk*4};
+    let handR = {x:x+26 + walk*6, y:baseY+86 - walk*4};
+
+    // knees/feet
+    let kneeL = {x:x-10, y:baseY+118};
+    let kneeR = {x:x+10, y:baseY+118};
+    let footL = {x:x-16 + walk*7, y:y};
+    let footR = {x:x+16 - walk*7, y:y};
+
+    // state-based posing
+    if (deuce.st==="block"){
+      // guard up
+      handL = {x:x-10, y:baseY+68};
+      handR = {x:x+14, y:baseY+66};
+    }
+
+    if (deuce.st==="hit"){
+      // recoil
+      handL = {x:x-34, y:baseY+80};
+      handR = {x:x+8, y:baseY+98};
+      footR = {x:x+22, y:y};
+    }
+
+    if (deuce.st==="attack" && deuce.move){
+      const p = (deuce.move.phase==="startup") ? 0.35 :
+                (deuce.move.phase==="active")  ? 1.0  :
+                0.55;
+
+      if (atkId==="a"){ // chop
+        handR = {x:x+face*(48*p), y:baseY+60 - 10*p};
+        handL = {x:x-face*(10*p), y:baseY+70};
+      } else if (atkId==="s"){ // knee
+        handL = {x:x-14, y:baseY+60};
+        handR = {x:x+16, y:baseY+58};
+        kneeR = {x:x+face*(10+12*p), y:baseY+102 - 10*p};
+        footR = {x:x+face*(12+18*p), y:y - 20*p};
+      } else if (atkId==="d" || atkId==="f"){ // kick / finisher
+        handL = {x:x-18, y:baseY+64};
+        handR = {x:x+18, y:baseY+62};
+        footR = {x:x+face*(28+70*p), y:y - 14*p};
+        kneeR = {x:x+face*(12+24*p), y:baseY+110 - 16*p};
+        if (atkId==="f"){
+          handR = {x:x+face*(60*p), y:baseY+54 - 12*p};
+          handL = {x:x-face*(22*p), y:baseY+72 - 8*p};
+        }
+      }
+    }
+
+    // shadow
+    ctx.fillStyle="rgba(0,0,0,0.55)";
+    ctx.beginPath(); ctx.ellipse(x, y+8, 26, 7, 0, 0, Math.PI*2); ctx.fill();
+
+    // colors
+    const skin="#d6a383";
+    const hair="#3a2a1f";
+    const hoodie="#101114";
+    const hoodie2="#1a1b20";
+    const pants="#caa670";
+    const shoe="#1a1b1f";
+    const accent="#f2f2f2";
+    const green="#36ff36";
+
+    // limbs (thick, outlined)
+    thickLine(shL.x, shL.y, handL.x, handL.y, 10, hoodie);
+    thickLine(shR.x, shR.y, handR.x, handR.y, 10, hoodie);
+    thickLine(hip.x-10, hip.y, footL.x, footL.y, 12, pants);
+    thickLine(hip.x+10, hip.y, footR.x, footR.y, 12, pants);
+
+    // torso hoodie
+    ctx.fillStyle=hoodie;
+    ctx.beginPath();
+    ctx.roundRect(x-28, baseY+44, 56, 56, 16);
+    ctx.fill();
+    ctx.fillStyle=hoodie2;
+    ctx.beginPath();
+    ctx.roundRect(x-26, baseY+44, 52, 16, 14);
+    ctx.fill();
+
+    // "Lions" text (stylized)
+    ctx.fillStyle=accent;
+    ctx.font="bold 12px Arial";
+    ctx.textAlign="center";
+    ctx.fillText("LIONS", x, baseY+76);
+    ctx.textAlign="left";
+
+    // head
+    ctx.fillStyle=skin;
+    ctx.beginPath();
+    ctx.roundRect(x-18, baseY+8, 36, 32, 12);
+    ctx.fill();
+
+    // hair swoop
+    ctx.fillStyle=hair;
+    ctx.beginPath();
+    ctx.roundRect(x-18, baseY+6, 36, 14, 10);
+    ctx.fill();
+    ctx.fillRect(x-18, baseY+10, 10, 20);
+    ctx.beginPath();
+    ctx.roundRect(x-2, baseY+4, 20, 14, 10);
+    ctx.fill();
+
+    // glasses
+    ctx.strokeStyle="rgba(220,235,255,0.85)";
+    ctx.lineWidth=3;
+    ctx.beginPath();
+    ctx.roundRect(x-14, baseY+22, 14, 10, 4);
+    ctx.roundRect(x+0, baseY+22, 14, 10, 4);
+    ctx.stroke();
+    ctx.strokeStyle="rgba(220,235,255,0.55)";
+    ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(x-0, baseY+27); ctx.lineTo(x+0, baseY+27); ctx.stroke();
+
+    // shoes
+    ctx.fillStyle=shoe;
+    ctx.beginPath(); ctx.roundRect(footL.x-16, footL.y-8, 30, 12, 6); ctx.fill();
+    ctx.beginPath(); ctx.roundRect(footR.x-16, footR.y-8, 30, 12, 6); ctx.fill();
+    ctx.fillStyle="rgba(255,255,255,0.10)";
+    ctx.fillRect(footL.x-10, footL.y-4, 14, 2);
+    ctx.fillRect(footR.x-10, footR.y-4, 14, 2);
+
+    // focus aura
+    if (isDown("shift") && isDown("arrowdown") && deuce.st!=="attack" && deuce.st!=="hit"){
+      ctx.strokeStyle="rgba(54,255,54,0.28)";
+      ctx.lineWidth=4;
+      ctx.beginPath(); ctx.arc(x, baseY+70, 42 + Math.sin(t*5)*2, 0, Math.PI*2); ctx.stroke();
+    }
+
+    // block shimmer
+    if (deuce.st==="block"){
+      ctx.fillStyle="rgba(54,255,54,0.08)";
+      ctx.fillRect(x-52, baseY+10, 104, 126);
+    }
+  }
+
+  function drawFoe(t){
+    const x = foe.x, y = foe.y;
+    const face = foe.face;
+    const boss = foe.type==="boss";
+    const scale = boss ? 1.18 : 1.0;
+
+    const walk = (foe.st==="walk") ? Math.sin(t*9) : 0;
+    const bob = (foe.st==="idle") ? Math.sin(t*3.2)*1.1 : Math.abs(walk)*1.5;
+    const baseY = y - (boss?150:138) + bob;
+
+    // joints
+    const head = {x, y:baseY+18};
+    const chest= {x, y:baseY+68};
+    const hip  = {x, y:baseY+104};
+
+    let shL = {x:x-20*scale, y:baseY+58};
+    let shR = {x:x+20*scale, y:baseY+58};
+    let handL = {x:x-30*scale - walk*5, y:baseY+92 + walk*4};
+    let handR = {x:x+30*scale + walk*5, y:baseY+92 - walk*4};
+
+    let footL = {x:x-18*scale + walk*7, y:y};
+    let footR = {x:x+18*scale - walk*7, y:y};
+
+    // attack posing
+    if (foe.st==="block"){
+      handL = {x:x-10*scale, y:baseY+70};
+      handR = {x:x+12*scale, y:baseY+68};
+    }
+    if (foe.st==="hit"){
+      handL = {x:x-36*scale, y:baseY+86};
+      handR = {x:x+6*scale, y:baseY+100};
+    }
+    if (foe.st==="attack" && foe.move){
+      const p = (foe.move.phase==="startup") ? 0.35 :
+                (foe.move.phase==="active")  ? 1.0 : 0.55;
+
+      const id = foe.move.id;
+      if (id==="a"){ // punch-ish
+        handR = {x:x+face*(48*p)*scale, y:baseY+66 - 8*p};
+      } else if (id==="s"){ // mid strike
+        handR = {x:x+face*(40*p)*scale, y:baseY+76 - 6*p};
+        handL = {x:x-face*(18*p)*scale, y:baseY+74};
+      } else { // kick
+        footR = {x:x+face*(34+66*p)*scale, y:y - 12*p*scale};
+      }
+    }
+
+    // shadow
+    ctx.fillStyle="rgba(0,0,0,0.55)";
+    ctx.beginPath(); ctx.ellipse(x, y+8, 28*scale, 7*scale, 0, 0, Math.PI*2); ctx.fill();
+
+    // colors
+    const metal="#6f7a86";
+    const metal2="#3f4954";
+    const joint="#1b2127";
+    const glowActive = "rgba(255,210,70,0.95)";
+    const glowWind = "rgba(80,210,255,0.85)";
+    const glow = foe.move && foe.move.phase==="active" ? glowActive : (foe.telegraph>0 ? glowWind : "rgba(80,210,255,0.35)");
+
+    // limbs
+    thickLine(shL.x, shL.y, handL.x, handL.y, 11*scale, metal2);
+    thickLine(shR.x, shR.y, handR.x, handR.y, 11*scale, metal2);
+    thickLine(hip.x-12*scale, hip.y, footL.x, footL.y, 13*scale, metal2);
+    thickLine(hip.x+12*scale, hip.y, footR.x, footR.y, 13*scale, metal2);
+
+    // torso
+    ctx.fillStyle=metal;
+    ctx.beginPath(); ctx.roundRect(x-34*scale, baseY+46, 68*scale, 62*scale, 18); ctx.fill();
+    ctx.fillStyle=metal2;
+    ctx.beginPath(); ctx.roundRect(x-26*scale, baseY+56, 52*scale, 42*scale, 14); ctx.fill();
+
+    // core glow
+    ctx.fillStyle=glow;
+    ctx.beginPath(); ctx.arc(x, baseY+78, 7*scale, 0, Math.PI*2); ctx.fill();
+
+    // head
+    ctx.fillStyle=metal;
+    ctx.beginPath(); ctx.roundRect(x-20*scale, baseY+10, 40*scale, 34*scale, 12); ctx.fill();
+
+    // eyes
+    ctx.fillStyle=glow;
+    ctx.fillRect(x-12*scale, baseY+26, 8*scale, 4*scale);
+    ctx.fillRect(x+4*scale, baseY+26, 8*scale, 4*scale);
+
+    // boss extras
+    if (boss){
+      ctx.fillStyle="rgba(255,120,70,0.25)";
+      ctx.fillRect(x-52*scale, baseY+44, 18*scale, 16*scale);
+      ctx.fillRect(x+34*scale, baseY+44, 18*scale, 16*scale);
+    }
+
+    // block shimmer
+    if (foe.st==="block"){
+      ctx.fillStyle="rgba(80,210,255,0.08)";
+      ctx.fillRect(x-56*scale, baseY+6, 112*scale, 150*scale);
+    }
+  }
+
+  function drawFX(){
+    for(let i=fx.length-1;i>=0;i--){
+      const p = fx[i];
+      p.life--;
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += (p.t==="dust") ? 0.25 : 0.35;
+
+      if (p.t==="spark"){
+        ctx.fillStyle = `rgba(255,210,70,${clamp(p.life/22,0,1)})`;
+        ctx.fillRect(p.x, p.y, 3, 3);
+      } else {
+        ctx.fillStyle = `rgba(180,220,255,${clamp(p.life/26,0,1)*0.35})`;
+        ctx.fillRect(p.x, p.y, 6, 2);
+      }
+      if (p.life<=0) fx.splice(i,1);
+    }
+  }
+
+  function drawHUD(){
+    function bar(x,y,w,h,p,label,col){
+      ctx.fillStyle="rgba(0,0,0,0.55)";
+      ctx.beginPath(); ctx.roundRect(x,y,w,h,8); ctx.fill();
+      ctx.fillStyle=col;
+      ctx.beginPath(); ctx.roundRect(x+2,y+2,(w-4)*clamp(p,0,1),h-4,7); ctx.fill();
+      ctx.strokeStyle="rgba(255,255,255,0.18)";
+      ctx.strokeRect(x,y,w,h);
+      ctx.fillStyle="#e9eef2";
+      ctx.font="12px Arial";
+      ctx.fillText(label, x, y-6);
+    }
+    bar(30, 36, 320, 16, deuce.hp/deuce.maxHp, "DEUCE", "#36ff36");
+    const foeLabel = foe.type==="boss" ? "MEGA ROBOT" : "TRAINING ROBOT";
+    bar(610, 36, 320, 16, foe.hp/foe.maxHp, foeLabel, "#ff5a5a");
+
+    // combo display
+    if (deuce.chainT>0 && deuce.chain.length>0){
+      ctx.fillStyle="rgba(0,0,0,0.45)";
+      ctx.beginPath(); ctx.roundRect(30, 64, 220, 22, 8); ctx.fill();
+      ctx.fillStyle="#cfe6ff";
+      ctx.font="13px Arial";
+      ctx.fillText("COMBO: " + deuce.chain.toUpperCase(), 40, 80);
+    }
+  }
+
+  function banner(text){
+    ctx.fillStyle="rgba(0,0,0,0.72)";
+    ctx.fillRect(0, 170, W, 170);
+    ctx.fillStyle="#36ff36";
+    ctx.font="bold 44px Arial";
+    ctx.textAlign="center";
+    ctx.fillText(text, W/2, 250);
+    ctx.textAlign="left";
+  }
+
+  // ---------------- Update loop (fixed step) ----------------
+  const FPS = 60;
+  const STEP = 1/FPS;
+  let acc = 0;
+  let last = performance.now();
+
+  function update(){
+    const L = LEVELS[level];
+
+    // decrement buffers
+    for(let i=deuce.buffer.length-1;i>=0;i--){
+      deuce.buffer[i].ttl--;
+      if (deuce.buffer[i].ttl<=0) deuce.buffer.splice(i,1);
+    }
+
+    // combo timer
+    if (deuce.chainT>0) deuce.chainT--;
+    else deuce.chain="";
+
+    // focus regen (Shift + Down)
+    const focusing = isDown("shift") && isDown("arrowdown") && deuce.st!=="attack" && deuce.st!=="hit" && state===STATE.PLAY;
+    if (focusing){
+      deuce.focusT++;
+      if (deuce.focusT % 12 === 0) deuce.hp = Math.min(deuce.maxHp, deuce.hp + 1); // slow regen
+    } else {
+      deuce.focusT = 0;
+    }
+
+    // apply hitstop
+    if (hitstop>0){ hitstop--; return; }
+
+    // ---------------- Title / Screens ----------------
+    if (state===STATE.TITLE){
+      if (wasPressed("enter")) resetRound();
+      if (wasPressed("i")) state = STATE.INSTR;
+      return;
+    }
+    if (state===STATE.INSTR){
+      if (wasPressed("enter")) state = STATE.TITLE;
+      return;
+    }
+    if (state===STATE.ROUND){
+      if (wasPressed("enter")) state = STATE.PLAY;
+      return;
+    }
+    if (state===STATE.WIN || state===STATE.LOSE){
+      if (wasPressed("enter")){
+        state = STATE.TITLE;
+        level = 0;
+        deuce.hp = deuce.maxHp;
+      }
+      return;
+    }
+
+    // ---------------- Player input buffering ----------------
+    if (wasPressed("a")) bufferInput("a");
+    if (wasPressed("s")) bufferInput("s");
+    if (wasPressed("d")) bufferInput("d");
+
+    // ---------------- Movement tuning (snappy) ----------------
+    const accel = 1.25;
+    const maxV = 5.3;
+    const friction = 0.84;
+    const airFriction = 0.92;
+
+    // resolve stun
+    if (deuce.stun>0) deuce.stun--;
+    if (deuce.blockstun>0) deuce.blockstun--;
+
+    // block state (dedicated SHIFT)
+    const wantsBlock = isDown("shift") && deuce.onGround && deuce.stun===0 && !deuce.move && !focusing;
+    if (wantsBlock) setState(deuce, "block");
+    if (!wantsBlock && deuce.st==="block") setState(deuce, "idle");
+
+    // horizontal input
+    let moveDir = 0;
+    if (isDown("arrowleft")) moveDir -= 1;
+    if (isDown("arrowright")) moveDir += 1;
+
+    if (deuce.stun===0 && deuce.blockstun===0 && deuce.st!=="block"){
+      if (moveDir!==0){
+        deuce.face = moveDir;
+        deuce.vx += moveDir*accel;
+        setState(deuce, deuce.onGround ? "walk" : "jump");
+      } else {
+        deuce.vx *= (deuce.onGround ? friction : airFriction);
+        if (deuce.onGround && !deuce.move && deuce.st!=="attack") setState(deuce, "idle");
+      }
+      deuce.vx = clamp(deuce.vx, -maxV, maxV);
+    } else {
+      deuce.vx *= 0.88;
+    }
+
+    // jump (bufferable feel)
+    if (wasPressed(" ") || wasPressed("space")){
+      if (deuce.onGround && deuce.stun===0 && deuce.blockstun===0 && deuce.st!=="block"){
+        deuce.vy = -12.8;
+        deuce.onGround=false;
+        setState(deuce, "jump");
+        dust(deuce.x, GROUND-6);
+      }
+    }
+
+    // physics
+    deuce.vy += GRAV;
+    deuce.x += deuce.vx;
+    deuce.y += deuce.vy;
+
+    if (deuce.y >= GROUND){
+      if (!deuce.onGround && deuce.vy>2) dust(deuce.x, GROUND-6);
+      deuce.y = GROUND;
+      deuce.vy = 0;
+      deuce.onGround=true;
+    }
+
+    deuce.x = clamp(deuce.x, 70, W-70);
+
+    // ---------------- Player move state machine ----------------
+    if (deuce.move){
+      const m = MOVES[deuce.move.id];
+      deuce.st = "attack";
+
+      deuce.move.t--;
+      if (deuce.move.t<=0){
+        if (deuce.move.phase==="startup"){
+          deuce.move.phase="active";
+          deuce.move.t = m.active;
+        } else if (deuce.move.phase==="active"){
+          deuce.move.phase="rec";
+          deuce.move.t = m.rec;
+        } else {
+          deuce.move = null;
+          setState(deuce, deuce.onGround ? "idle" : "jump");
+        }
+      }
+    } else {
+      // if free, consume buffered move
+      if (deuce.stun===0 && deuce.blockstun===0 && deuce.st!=="block"){
+        consumeBuffered();
+      }
+    }
+
+    // ---------------- Enemy AI ----------------
+    if (foe.stun>0) foe.stun--;
+    if (foe.blockstun>0) foe.blockstun--;
+
+    const dist = Math.abs(deuce.x - foe.x);
+    foe.face = (deuce.x > foe.x) ? 1 : -1;
+
+    // decide to block
+    if (!foe.move && foe.stun===0 && foe.blockstun===0 && foeWantsBlock()){
+      setState(foe, "block");
+    } else if (foe.st==="block" && Math.random()<0.03){
+      setState(foe, "idle");
+    }
+
+    // movement (space like a fighter)
+    if (foe.stun===0 && foe.blockstun===0 && foe.st!=="block"){
+      const desired = (foe.type==="boss") ? 165 : 150;
+      const sp = L.enemySpeed;
+
+      if (!foe.move && foe.telegraph===0){
+        if (dist > desired+40){
+          foe.vx = lerp(foe.vx, foe.face*sp, 0.22);
+          setState(foe, "walk");
+        } else if (dist < desired-25){
+          foe.vx = lerp(foe.vx, -foe.face*(sp*0.65), 0.22);
+          setState(foe, "walk");
+        } else {
+          foe.vx = lerp(foe.vx, 0, 0.25);
+          setState(foe, "idle");
+        }
+      }
+    } else {
+      foe.vx *= 0.85;
+    }
+
+    foe.x += foe.vx;
+    foe.x = clamp(foe.x, 70, W-70);
+
+    // Telegraph countdown
+    if (foe.telegraph>0){
+      foe.telegraph--;
+      if (foe.telegraph===0){
+        foeCommitQueued();
+      }
+    } else {
+      // try to start attack
+      foe.aiT++;
+      if (foe.aiT % 22 === 0 && dist < 240 && foe.stun===0 && foe.blockstun===0 && foe.st!=="block"){
+        foeTryAttack();
+      }
+    }
+
+    // Enemy move state machine
+    if (foe.move){
+      const m = MOVES[foe.move.id];
+      setState(foe, "attack");
+
+      foe.move.t--;
+      if (foe.move.t<=0){
+        if (foe.move.phase==="startup"){
+          foe.move.phase="active";
+          foe.move.t = m.active;
+        } else if (foe.move.phase==="active"){
+          foe.move.phase="rec";
+          foe.move.t = m.rec;
+        } else {
+          foe.move = null;
+          setState(foe, "idle");
+        }
+      }
+    }
+
+    // ---------------- Hit detection ----------------
+    // player hits foe
+    const pAtk = attackBox(deuce);
+    if (pAtk && deuce.move && !deuce.move.didHit){
+      const fH = hurtbox(foe);
+      if (rectOverlap(pAtk, fH)){
+        const m = MOVES[deuce.move.id];
+        applyHit(deuce, foe, m.dmg, m.push);
+        deuce.move.didHit = true;
+
+        // occasional heal pickup drop (readable + fun)
+        const drop = (deuce.move.id==="f") ? 0.55 : 0.22;
+        if (Math.random()<drop) spawnBattery(foe.x + rand(-20,20), foe.y-80);
+        spark(foe.x, foe.y-90, deuce.face);
+      }
+    }
+
+    // foe hits player
+    const fAtk = attackBox(foe);
+    if (fAtk && foe.move && !foe.move.didHit){
+      const pH = hurtbox(deuce);
+      if (rectOverlap(fAtk, pH)){
+        const m = MOVES[foe.move.id];
+        applyHit(foe, deuce, L.dmg, m.push*0.9);
+        foe.move.didHit = true;
+      }
+    }
+
+    // ---------------- Pickups ----------------
+    for(let i=pickups.length-1;i>=0;i--){
+      const p = pickups[i];
+      p.life--;
+      p.vy += 0.5;
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vx *= 0.92;
+      if (p.y > GROUND-18){ p.y = GROUND-18; p.vy *= -0.25; }
+
+      const pBox = {x:p.x-10,y:p.y-10,w:20,h:20};
+      if (rectOverlap(pBox, hurtbox(deuce))){
+        deuce.hp = Math.min(deuce.maxHp, deuce.hp + 18);
+        spark(deuce.x, deuce.y-90, 1);
+        doHitstop(3);
+        pickups.splice(i,1);
+        continue;
+      }
+      if (p.life<=0) pickups.splice(i,1);
+    }
+
+    // ---------------- Win/Lose ----------------
+    if (foe.hp <= 0){
+      level++;
+      if (level >= LEVELS.length){
+        state = STATE.WIN;
+      } else {
+        resetRound();
+      }
+    }
+    if (deuce.hp <= 0){
+      state = STATE.LOSE;
+    }
+
+    // ---------------- FX update ----------------
+    // (particles handled in render step by decrementing life in drawFX for simplicity)
+  }
+
+  // ---------------- Render ----------------
+  function render(now){
+    // screen shake
+    const sx = (shake>0) ? rand(-shake, shake) : 0;
+    const sy = (shake>0) ? rand(-shake, shake) : 0;
+    shake = Math.max(0, shake-0.35);
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    const scene = LEVELS[level]?.scene || "hallway";
+    drawBg(scene, now);
+
+    // overlays
+    if (state===STATE.TITLE){
+      ctx.fillStyle="rgba(0,0,0,0.70)";
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle="#36ff36";
+      ctx.font="bold 54px Arial";
+      ctx.textAlign="center";
+      ctx.fillText("SHORT CIRCUIT SHOWDOWN", W/2, 220);
+      ctx.fillStyle="#e9eef2";
+      ctx.font="20px Arial";
+      ctx.fillText("Press ENTER to Start", W/2, 280);
+      ctx.font="16px Arial";
+      ctx.fillText("Press I for Instructions", W/2, 312);
+      ctx.font="14px Arial";
+      ctx.fillStyle="rgba(233,238,242,0.85)";
+      ctx.fillText("A student detective. A school. Robots disguised as students. Training forms only.", W/2, 360);
+      ctx.textAlign="left";
+      ctx.restore();
+      return;
+    }
+
+    if (state===STATE.INSTR){
+      ctx.fillStyle="rgba(0,0,0,0.75)";
+      ctx.fillRect(70,70,820,400);
+      ctx.fillStyle="#e9eef2";
+      ctx.font="bold 42px Arial";
+      ctx.textAlign="center";
+      ctx.fillText("INSTRUCTIONS", W/2, 135);
+      ctx.font="18px Arial";
+      ctx.fillText("← / → Move     SPACE Jump     SHIFT Block", W/2, 200);
+      ctx.fillText("A Chop     S Knee     D Kick", W/2, 238);
+      ctx.font="16px Arial";
+      ctx.fillStyle="rgba(233,238,242,0.9)";
+      ctx.fillText("Combos: chain A/S/D quickly to trigger a Finisher.", W/2, 286);
+      ctx.fillText("Focus heal: hold SHIFT + ↓ to regain health slowly (only if safe).", W/2, 318);
+      ctx.fillText("Enemy attacks are telegraphed — step out of range or block.", W/2, 350);
+      ctx.fillStyle="#36ff36";
+      ctx.fillText("Press ENTER to return", W/2, 415);
+      ctx.textAlign="left";
+      ctx.restore();
+      return;
+    }
+
+    if (state===STATE.ROUND){
+      // draw fighters idle in background
+      drawDeuce(now/1000);
+      drawFoe(now/1000);
+      drawHUD();
+      ctx.fillStyle="rgba(0,0,0,0.60)";
+      ctx.fillRect(0,170,W,170);
+      ctx.fillStyle="#e9eef2";
+      ctx.font="bold 34px Arial";
+      ctx.textAlign="center";
+      ctx.fillText("ROUND: " + LEVELS[level].name, W/2, 235);
+      ctx.font="18px Arial";
+      ctx.fillStyle="rgba(233,238,242,0.85)";
+      ctx.fillText("Press ENTER to begin", W/2, 285);
+      ctx.textAlign="left";
+      ctx.restore();
+      return;
+    }
+
+    // game render
+    drawHUD();
+
+    // draw pickups (batteries)
+    for (const p of pickups){
+      ctx.fillStyle="rgba(0,0,0,0.4)";
+      ctx.beginPath(); ctx.ellipse(p.x, p.y+18, 14, 4, 0, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle="rgba(54,255,54,0.85)";
+      ctx.beginPath(); ctx.roundRect(p.x-10, p.y, 20, 14, 6); ctx.fill();
+      ctx.fillStyle="rgba(0,0,0,0.25)";
+      ctx.fillRect(p.x-6, p.y+4, 12, 2);
+      ctx.fillStyle="rgba(240,240,240,0.75)";
+      ctx.fillRect(p.x-7, p.y+6, 4, 4);
+      ctx.fillRect(p.x+3, p.y+6, 4, 4);
+    }
+
+    // telegraph ring for foe
+    if (foe.telegraph>0){
+      ctx.strokeStyle="rgba(80,210,255,0.55)";
+      ctx.lineWidth=4;
+      ctx.beginPath(); ctx.arc(foe.x, foe.y-120, 34 + Math.sin(now/80)*2, 0, Math.PI*2); ctx.stroke();
+      ctx.lineWidth=1;
+    }
+
+    drawDeuce(now/1000);
+    drawFoe(now/1000);
+
+    drawFX();
+
+    if (state===STATE.WIN){
+      ctx.fillStyle="rgba(0,0,0,0.75)";
+      ctx.fillRect(0,170,W,170);
+      ctx.fillStyle="#36ff36";
+      ctx.font="bold 52px Arial";
+      ctx.textAlign="center";
+      ctx.fillText("SYSTEMS RESET!", W/2, 250);
+      ctx.fillStyle="#e9eef2";
+      ctx.font="18px Arial";
+      ctx.fillText("Deuce wins the training showdown. Very polite. Very dramatic.", W/2, 290);
+      ctx.fillStyle="#36ff36";
+      ctx.fillText("Press ENTER for Title", W/2, 325);
+      ctx.textAlign="left";
+    }
+
+    if (state===STATE.LOSE){
+      ctx.fillStyle="rgba(0,0,0,0.75)";
+      ctx.fillRect(0,170,W,170);
+      ctx.fillStyle="#ff5a5a";
+      ctx.font="bold 52px Arial";
+      ctx.textAlign="center";
+      ctx.fillText("TRAINING FAILED", W/2, 250);
+      ctx.fillStyle="#e9eef2";
+      ctx.font="18px Arial";
+      ctx.fillText("Deuce needs a snack and a rematch.", W/2, 290);
+      ctx.fillStyle="#36ff36";
+      ctx.fillText("Press ENTER for Title", W/2, 325);
+      ctx.textAlign="left";
+    }
+
+    ctx.restore();
+  }
+
+  // ---------------- Main loop ----------------
+  function loop(now){
+    const dt = Math.min(0.05, (now-last)/1000);
+    last = now;
+    acc += dt;
+
+    // process inputs for this frame
+    if (wasPressed("enter")){
+      if (state===STATE.TITLE) resetRound();
+      else if (state===STATE.INSTR) state = STATE.TITLE;
+      else if (state===STATE.ROUND) state = STATE.PLAY;
+      else if (state===STATE.WIN || state===STATE.LOSE){ state = STATE.TITLE; level=0; deuce.hp=deuce.maxHp; }
+    }
+    if (wasPressed("i") && state===STATE.TITLE) state = STATE.INSTR;
+
+    // fixed timestep update
+    while(acc >= STEP){
+      // clear pressed edges only once per fixed step consumption
+      update();
+      pressed.clear();
+      acc -= STEP;
+    }
+
+    render(now);
+    requestAnimationFrame(loop);
+  }
+
+  // Start
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
